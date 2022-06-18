@@ -1,0 +1,18 @@
+[package]
+name = "squeezer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tui = "0.18"
+histogram = "0.6.9"
+tokio = { version = "1", features = ["time", "macros", "test-util"] }
+thiserror = "1.0.31"
+futures = "0.3"
+parking_lot = "0.12"
+tap = "1"
+hashbrown = "0.12"
+crossterm  = "0.23"
+rand = "0.8"
+pin-project = "1"
+median = "0.3"
