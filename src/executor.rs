@@ -1,5 +1,5 @@
 use crate::gen::Generator;
-use crate::measure::{QpsMeasure, QpsMeasureState};
+use crate::measure::{QpsMeasure, PerSecondMeasurementState, QpsPushMetric};
 use crate::plan::Plan;
 use futures::{pin_mut, StreamExt};
 use histogram::Histogram;
@@ -8,36 +8,53 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::{fmt, mem};
 use tap::Pipe;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 pub struct ExecutorStatsData<const N: usize, O>
-where
-    O: Hash + Eq + Send + Clone + 'static,
+    where
+        O: Hash + Eq + Send + Clone + 'static,
 {
-    pub qps: QpsMeasure<N>,
+    pub qps: QpsMeasure<N, QpsPushMetric>,
+    pub concurrency: QpsMeasure<N, Histogram>,
     pub latencies: Histogram,
-    pub results: HashMap<O, QpsMeasure<N>>,
+    pub results: HashMap<O, QpsMeasure<N, QpsPushMetric>>,
 }
 
-pub struct ExecutorStatsFrozenData<const N: usize, O>
-where
-    O: Hash + Eq + Send + Clone + 'static,
+impl<const N: usize, O> Default for ExecutorStatsData<N, O>
+    where
+        O: Hash + Eq + Send + Clone + 'static,
 {
-    pub qps: QpsMeasureState<N>,
+    fn default() -> Self {
+        ExecutorStatsData {
+            qps: Default::default(),
+            concurrency: Default::default(),
+            latencies: Default::default(),
+            results: Default::default(),
+        }
+    }
+}
+
+
+pub struct ExecutorStatsFrozenData<const N: usize, O>
+    where
+        O: Hash + Eq + Send + Clone + 'static,
+{
+    pub qps: PerSecondMeasurementState<N, QpsPushMetric>,
+    pub concurrency: PerSecondMeasurementState<N, Histogram>,
     pub latencies: Histogram,
-    pub results: HashMap<O, QpsMeasureState<N>>,
+    pub results: HashMap<O, PerSecondMeasurementState<N, QpsPushMetric>>,
 }
 
 impl<const N: usize, O> fmt::Debug for ExecutorStatsFrozenData<N, O>
-where
-    O: Debug + Hash + Eq + Send + Clone + 'static,
+    where
+        O: Debug + Hash + Eq + Send + Clone + 'static,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_fmt(format_args!("qps: {}\n", self.qps.current()))?;
+        // f.write_fmt(format_args!("qps: {}\n", self.qps.current_in_window()))?;
         f.write_str("latencies:\n")?;
         f.write_fmt(format_args!(
             "\tp50 = {}\n",
@@ -61,22 +78,22 @@ where
         ))?;
         f.write_str("results:\n")?;
         for (k, v) in &self.results {
-            f.write_fmt(format_args!("\t{:?} = {}\n", k, v.current()))?;
+            // f.write_fmt(format_args!("\t{:?} = {}\n", k, v.current_in_window()))?;
         }
         Ok(())
     }
 }
 
 pub struct ExecutorStats<const N: usize, O>
-where
-    O: Hash + Eq + Send + Clone + 'static,
+    where
+        O: Hash + Eq + Send + Clone + 'static,
 {
-    inner: Arc<Mutex<ExecutorStatsData<N, O>>>,
+    inner: Weak<Mutex<ExecutorStatsData<N, O>>>,
 }
 
 impl<const N: usize, O> Clone for ExecutorStats<N, O>
-where
-    O: Hash + Eq + Send + Clone + 'static,
+    where
+        O: Hash + Eq + Send + Clone + 'static,
 {
     fn clone(&self) -> Self {
         ExecutorStats {
@@ -86,67 +103,72 @@ where
 }
 
 impl<const N: usize, O> ExecutorStats<N, O>
-where
-    O: Hash + Eq + Send + Clone + 'static,
+    where
+        O: Hash + Eq + Send + Clone + 'static,
 {
-    pub fn load(&self) -> ExecutorStatsFrozenData<N, O> {
-        let locked = self.inner.lock();
+    pub fn load(&self) -> Option<ExecutorStatsFrozenData<N, O>> {
+        if let Some(inner) = self.inner.upgrade() {
+            let locked = inner.lock();
 
-        ExecutorStatsFrozenData {
-            qps: locked.qps.state(),
-            latencies: locked.latencies.clone(),
-            results: locked
-                .results
-                .iter()
-                .map(|(k, v)| (k.clone(), v.state()))
-                .collect(),
+            Some(ExecutorStatsFrozenData {
+                qps: locked.qps.state(),
+                concurrency: locked.concurrency.state(),
+                latencies: locked.latencies.clone(),
+                results: locked
+                    .results
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.state()))
+                    .collect(),
+            })
+        } else {
+            None
         }
     }
 }
 
 pub struct Executor<const N: usize, P, O, F, Fn>
-where
-    P: Plan,
-    O: Hash + Eq + Send + Clone + 'static,
-    F: 'static + Future<Output = O> + Send,
-    Fn: 'static + FnMut() -> F + Send,
+    where
+        P: Plan,
+        O: Hash + Eq + Send + Clone + 'static,
+        F: 'static + Future<Output=O> + Send,
+        Fn: 'static + FnMut() -> F + Send,
 {
     generator: Generator<P>,
     func: Fn,
     concurrency: Semaphore,
-    stats: ExecutorStats<N, O>,
+    concurrency_num: usize,
+    stats: Arc<Mutex<ExecutorStatsData<N, O>>>,
 }
 
 impl<const N: usize, P, O, F, Fn> Executor<N, P, O, F, Fn>
-where
-    P: Plan,
-    O: Hash + Eq + Send + Clone + 'static,
-    F: 'static + Future<Output = O> + Send,
-    Fn: 'static + FnMut() -> F + Send,
+    where
+        P: Plan,
+        O: Hash + Eq + Send + Clone + 'static,
+        F: 'static + Future<Output=O> + Send,
+        Fn: 'static + FnMut() -> F + Send,
 {
     pub fn new(plan: P, func: Fn, max_concurrency: usize) -> Self {
         Executor {
             generator: Generator::new(plan),
             func,
             concurrency: Semaphore::new(max_concurrency),
-            stats: ExecutorStats {
-                inner: Arc::new(Mutex::new(ExecutorStatsData {
-                    qps: QpsMeasure::new(),
-                    latencies: Default::default(),
-                    results: Default::default(),
-                })),
-            },
+            concurrency_num: max_concurrency,
+            stats: Arc::new(Mutex::new(ExecutorStatsData::default())),
         }
     }
 
     pub fn stats(&self) -> ExecutorStats<N, O> {
-        self.stats.clone()
+        let weak = Arc::downgrade(&self.stats);
+        ExecutorStats {
+            inner: weak,
+        }
     }
 
-    pub async fn spawn(self) {
+    pub async fn run(self) {
         let gen_stream = self.generator.start();
         let concurrency = Arc::new(self.concurrency);
         let stats = self.stats;
+        let concurrency_num = self.concurrency_num;
 
         let mut func = self.func;
 
@@ -156,17 +178,23 @@ where
             let concurrency = concurrency.clone();
             let stats = stats.clone();
 
+            let concurrency_used = concurrency_num - concurrency.available_permits();
+
+            stats.lock().concurrency.push_metric(concurrency_used.try_into().unwrap());
+
             if let Ok(permit) = concurrency.try_acquire_owned() {
                 let fut = func();
-                stats.inner.lock().qps.inc();
+                stats.lock().pipe(|locked| {
+                    locked.qps.push_metric(1);
+                });
 
                 tokio::spawn(async move {
                     let started_at = Instant::now();
                     let res = fut.await;
                     let took_time = started_at.elapsed();
 
-                    stats.inner.lock().pipe(|mut stats| {
-                        stats.results.entry(res).or_default().inc();
+                    stats.lock().pipe(|mut stats| {
+                        stats.results.entry(res).or_default().push_metric(1);
                         stats
                             .latencies
                             .increment(took_time.as_millis().try_into().expect("overflow"))
@@ -188,6 +216,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use tokio::time::sleep;
+    use crate::collector::Collector;
 
     #[tokio::test]
     async fn test_basic() {
@@ -212,9 +241,11 @@ mod tests {
         );
 
         let stat = executor.stats();
-        executor.spawn().await;
+        let collector = Collector::new(stat);
+        collector.spawn();
+        executor.run().await;
 
-        // println!("stats = {:#?}", stat.load());
+        println!("collectino = {:?}", collector.data_view().clone());
 
         assert_eq!(counter.load(Ordering::Relaxed), 3);
     }
